@@ -505,6 +505,12 @@ pub enum ContractError {
     /// This error occurs when attempting to manage the circuit
     /// breaker without setting an admin.
     CircuitBreakerAdminNotSet = 803,
+
+    /// Invalid circuit breaker threshold.
+    ///
+    /// This error occurs when the circuit breaker threshold
+    /// is not in the valid range (1-100).
+    InvalidCircuitBreakerThreshold = 804,
     
     // =========================================================================
     // Threshold Monitoring Errors (900-999)
@@ -891,6 +897,7 @@ impl ContractError {
             ContractError::CircuitBreakerConfigFailed => "Circuit breaker configuration failed",
             ContractError::CircuitBreakerResetFailed => "Circuit breaker reset failed",
             ContractError::CircuitBreakerAdminNotSet => "Circuit breaker admin not set",
+            ContractError::InvalidCircuitBreakerThreshold => "Invalid circuit breaker threshold (must be 1-100)",
             
             // Threshold Monitoring Errors
             ContractError::ThresholdBreached => "Threshold breached",

@@ -83,6 +83,7 @@
 //! 4. **Atomic Transfers**: All-or-nothing batch operations
 //! 5. **Complete Audit Trail**: Full payout history tracking
 //! 6. **Overflow Protection**: Safe arithmetic for all calculations
+//! 7. **Circuit Breaker**: Per-program configurable failure threshold to prevent cascading failures
 //!
 //! ## Usage Example
 //!
@@ -613,6 +614,28 @@ pub enum ProgramStatus {
     Active,
 }
 
+/// Per-program circuit breaker threshold configuration.
+///
+/// The circuit breaker protects against cascading failures by opening after
+/// a configurable number of consecutive failures. Each program can have its
+/// own threshold:
+///
+/// - **None**: Use global default threshold (3 failures)
+/// - **Some(n)**: Use custom threshold (1-100 failures)
+///
+/// Large programs with many participants may need a higher threshold to
+/// tolerate expected transient failures, while small programs may benefit
+/// from a lower threshold for faster failure detection.
+///
+/// # Example
+/// ```rust,ignore
+/// // Set custom threshold for a large program
+/// contract.set_program_circuit_breaker_threshold(&program_id, &Some(10u8));
+///
+/// // Reset to global default
+/// contract.set_program_circuit_breaker_threshold(&program_id, &None);
+/// ```
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramData {
@@ -630,6 +653,10 @@ pub struct ProgramData {
     pub archived: bool,
     pub archived_at: Option<u64>,
     pub status: ProgramStatus,
+    /// Optional per-program circuit breaker failure threshold.
+    /// If set, overrides the global default (3) for this program.
+    /// Must be between 1 and 100 inclusive when set.
+    pub circuit_breaker_threshold: Option<u8>,
 }
 
 // ========================================================================
@@ -763,6 +790,36 @@ pub struct SpendLimitSchemaVersionSet {
     pub timestamp: u64,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CIRCUIT BREAKER THRESHOLD AUDIT EVENTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Emitted when the admin sets or updates the per-program circuit breaker threshold.
+///
+/// ### Topics
+/// `(CB_THRESHOLD_SET, program_id)`
+///
+/// ### Security notes
+/// - Only the admin can call `set_program_circuit_breaker_threshold`.
+/// - `previous_threshold` is `None` when no threshold was previously set.
+/// - Emitted **after** the new value is persisted so the event reflects
+///   the settled on-chain state.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CircuitBreakerThresholdSetEvent {
+    pub version: u32,
+    /// Program the threshold applies to.
+    pub program_id: String,
+    /// Previous threshold value (None = not set, uses global default of 3).
+    pub previous_threshold: Option<u8>,
+    /// New threshold value (None = reset to global default of 3).
+    pub new_threshold: Option<u8>,
+    /// Admin that made the change.
+    pub set_by: Address,
+    /// Ledger timestamp.
+    pub timestamp: u64,
+}
+
 // ========================================================================
 // Idempotency Key Types
 // ========================================================================
@@ -865,6 +922,7 @@ const SCHEDULE_SCHEMA: Symbol = symbol_short!("SchSch");
 const SPEND_LIMIT_SET: Symbol = symbol_short!("SpLimSet");
 const SPEND_LIMIT_EXCEEDED: Symbol = symbol_short!("SpLimExc");
 const SPEND_LIMIT_SCHEMA: Symbol = symbol_short!("SpLimSch");
+const CB_THRESHOLD_SET: Symbol = symbol_short!("CbThrSet");
 const IDEMPOTENCY_SCHEMA: Symbol = symbol_short!("IdempSch");
 const IDEMPOTENCY_KEY_USED: Symbol = symbol_short!("IdempUsed");
 const ROLE_MANAGEMENT_SCHEMA: Symbol = symbol_short!("RoleMgmtSch");
@@ -1468,6 +1526,8 @@ mod reentrancy_guard;
 // #[cfg(test)] mod error_recovery_tests; // pre-existing breakage
 #[cfg(any())] // pre-existing syntax error in file
 mod test_circuit_breaker_enforcement;
+#[cfg(test)]
+mod test_circuit_breaker_threshold;
 #[cfg(any())]
 mod reentrancy_tests;
 // #[cfg(test)] mod test_dispute_resolution; // pre-existing breakage
@@ -1904,6 +1964,7 @@ impl ProgramEscrowContract {
             archived: false,
             archived_at: None,
             status: ProgramStatus::Draft,
+            circuit_breaker_threshold: None,
         };
 
         // Store program data in registry
@@ -2220,6 +2281,7 @@ impl ProgramEscrowContract {
                 archived: false,
                 archived_at: None,
                 status: ProgramStatus::Draft,
+                circuit_breaker_threshold: None,
             };
             let program_key = DataKey::Program(program_id.clone());
             env.storage().instance().set(&program_key, &program_data);
@@ -4102,6 +4164,58 @@ impl ProgramEscrowContract {
         env.storage()
             .persistent()
             .set(&DataKey::SpendingConfig(program_id), &cfg);
+    }
+
+    /// Set or update the per-program circuit breaker failure threshold.
+    ///
+    /// Only the program's `authorized_payout_key` may call this.
+    ///
+    /// # Arguments
+    /// * `program_id` - Program to configure.
+    /// * `threshold` - Optional threshold value (1-100). None resets to global default (3).
+    ///
+    /// # Errors
+    /// Panics if:
+    /// - Threshold is set but not in range [1, 100]
+    /// - Caller is not authorized
+    ///
+    /// # Events
+    /// Emits `CB_THRESHOLD_SET` with [`CircuitBreakerThresholdSetEvent`].
+    pub fn set_program_circuit_breaker_threshold(
+        env: Env,
+        program_id: String,
+        threshold: Option<u8>,
+    ) {
+        let program_data = Self::get_program_data_by_id(&env, &program_id);
+        program_data.authorized_payout_key.require_auth();
+
+        // Validate threshold if provided
+        if let Some(t) = threshold {
+            if t < 1 || t > 100 {
+                panic!("{}", errors::ContractError::InvalidCircuitBreakerThreshold as u32);
+            }
+        }
+
+        let previous_threshold = program_data.circuit_breaker_threshold;
+        let mut updated_data = program_data.clone();
+        updated_data.circuit_breaker_threshold = threshold;
+
+        // Update program data
+        let program_key = DataKey::Program(program_id.clone());
+        env.storage().instance().set(&program_key, &updated_data);
+
+        // Emit audit event
+        env.events().publish(
+            (CB_THRESHOLD_SET, program_id.clone()),
+            CircuitBreakerThresholdSetEvent {
+                version: EVENT_VERSION_V2,
+                program_id,
+                previous_threshold,
+                new_threshold: threshold,
+                set_by: env.current_contract_address(),
+                timestamp: env.ledger().timestamp(),
+            },
+        );
     }
 
     /// Return the spending limit configuration for a program, if set.

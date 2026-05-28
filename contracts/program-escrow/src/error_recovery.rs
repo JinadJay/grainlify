@@ -280,11 +280,19 @@ pub fn record_success(env: &Env) {
 ///
 /// Increments the failure counter and opens the circuit if the threshold
 /// is exceeded. Records error log entry.
+///
+/// # Arguments
+/// * `env` - Soroban environment
+/// * `program_id` - Program identifier for logging
+/// * `operation` - Operation that failed
+/// * `error_code` - Error code that occurred
+/// * `threshold_override` - Optional per-program threshold. If None, uses global config.
 pub fn record_failure(
     env: &Env,
     program_id: String,
     operation: soroban_sdk::Symbol,
     error_code: u32,
+    threshold_override: Option<u32>,
 ) {
     let config = get_config(env);
     let failures = get_failure_count(env) + 1;
@@ -330,8 +338,11 @@ pub fn record_failure(
         Some(error_code),
     );
 
+    // Use override if provided, otherwise use global config threshold
+    let threshold = threshold_override.unwrap_or(config.failure_threshold);
+
     // Open circuit if threshold exceeded
-    if failures >= config.failure_threshold {
+    if failures >= threshold {
         open_circuit_internal(env, symbol_short!("auto"));
     }
 }
@@ -558,6 +569,7 @@ pub fn execute_with_retry<F>(
     config: &RetryConfig,
     program_id: String,
     operation: soroban_sdk::Symbol,
+    threshold_override: Option<u32>,
     mut op: F,
 ) -> RetryResult
 where
@@ -600,7 +612,7 @@ where
             }
             Err(code) => {
                 last_error = code;
-                record_failure(env, program_id.clone(), operation.clone(), code);
+                record_failure(env, program_id.clone(), operation.clone(), code, threshold_override);
             }
         }
     }
