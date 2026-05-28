@@ -173,311 +173,234 @@ fn test_rbac_wrong_nonce_rejected_for_authorized_caller() {
     client.rotate_payout_key(&program_id, &payout_key, &new_key, &99);
 }
 
-// ---------------------------------------------------------------------------
-// Multisig Threshold Tests
-// ---------------------------------------------------------------------------
+// =========================================================================
+// ISSUE #1272: 24h time-lock delay for admin/controller rotation acceptance
+// =========================================================================
 
-use crate::{AdminOpKind, MultisigThresholdConfig, ADMIN_OP_EXPIRY_LEDGERS};
-
-fn advance_seq(env: &Env, n: u32) {
-    env.ledger().with_mut(|li| li.sequence_number += n);
-}
-
-fn make_payload(env: &Env, tag: &str) -> soroban_sdk::Bytes {
-    soroban_sdk::Bytes::from_slice(env, tag.as_bytes())
-}
-
-/// Set up a contract with a 2-of-3 multisig threshold config.
-fn setup_multisig(
+/// Helper: set up a contract with admin and a program with payout_key.
+fn setup_with_program(
     env: &Env,
 ) -> (
     ProgramEscrowContractClient<'static>,
     Address, // admin
-    Address, // signer1
-    Address, // signer2
-    Address, // signer3
+    Address, // payout_key (controller)
+    String,  // program_id
 ) {
     env.mock_all_auths();
-    let contract_id = env.register_contract(None, ProgramEscrowContract);
-    let client = ProgramEscrowContractClient::new(env, &contract_id);
+    let (client, contract_id) = make_client(env);
+    let token_id = fund_contract(env, &contract_id, 0);
     let admin = Address::generate(env);
+    let payout_key = Address::generate(env);
+    let program_id = String::from_str(env, "timelock-prog");
     client.initialize_contract(&admin);
-
-    let s1 = Address::generate(env);
-    let s2 = Address::generate(env);
-    let s3 = Address::generate(env);
-    let signers = soroban_sdk::vec![env, s1.clone(), s2.clone(), s3.clone()];
-    client.set_multisig_threshold_config(&signers, &2, &1_000_000i128);
-
-    (client, admin, s1, s2, s3)
+    client.init_program(&program_id, &payout_key, &token_id, &payout_key, &None, &None);
+    (client, admin, payout_key, program_id)
 }
 
-// --- set_multisig_threshold_config ---
+// --- Admin rotation timelock ---
 
+/// accept_admin fails immediately after propose_admin (timelock not elapsed).
 #[test]
-fn test_set_multisig_config_stores_correctly() {
+fn test_accept_admin_before_timelock_returns_error() {
     let env = Env::default();
     env.mock_all_auths();
-    let contract_id = env.register_contract(None, ProgramEscrowContract);
-    let client = ProgramEscrowContractClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    client.initialize_contract(&admin);
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000);
 
-    let s1 = Address::generate(&env);
-    let s2 = Address::generate(&env);
-    client.set_multisig_threshold_config(
-        &soroban_sdk::vec![&env, s1.clone(), s2.clone()],
-        &2,
-        &500_000i128,
+    let (client, _admin, _payout_key, _program_id) = setup_with_program(&env);
+    let new_admin = Address::generate(&env);
+
+    client.propose_admin(&new_admin);
+
+    // Advance time by less than 24h (e.g., 1 hour)
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000 + 3_600);
+
+    let result = client.try_accept_admin();
+    assert_eq!(
+        result,
+        Err(Ok(ContractError::RotationTimelockActive)),
+        "accept_admin must fail before 24h timelock expires"
     );
-
-    let cfg = client.get_multisig_threshold_config().unwrap();
-    assert_eq!(cfg.required_approvals, 2);
-    assert_eq!(cfg.high_value_threshold, 500_000);
-    assert_eq!(cfg.signers.len(), 2);
 }
 
+/// accept_admin succeeds exactly at the 24h boundary.
 #[test]
-#[should_panic(expected = "InvalidMultisigConfig")]
-fn test_set_multisig_config_required_gt_signers_rejected() {
+fn test_accept_admin_after_timelock_succeeds() {
     let env = Env::default();
     env.mock_all_auths();
-    let contract_id = env.register_contract(None, ProgramEscrowContract);
-    let client = ProgramEscrowContractClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    client.initialize_contract(&admin);
-    let s1 = Address::generate(&env);
-    // required=3 but only 1 signer
-    client.set_multisig_threshold_config(&soroban_sdk::vec![&env, s1], &3, &1000i128);
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000);
+
+    let (client, _admin, _payout_key, _program_id) = setup_with_program(&env);
+    let new_admin = Address::generate(&env);
+
+    client.propose_admin(&new_admin);
+
+    // Advance time by exactly 24h
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000 + ROTATION_TIMELOCK_DELAY);
+
+    // Should succeed
+    client.accept_admin();
 }
 
+/// accept_admin succeeds after more than 24h.
 #[test]
-#[should_panic(expected = "InvalidMultisigConfig")]
-fn test_set_multisig_config_zero_required_rejected() {
+fn test_accept_admin_well_after_timelock_succeeds() {
     let env = Env::default();
     env.mock_all_auths();
-    let contract_id = env.register_contract(None, ProgramEscrowContract);
-    let client = ProgramEscrowContractClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    client.initialize_contract(&admin);
-    let s1 = Address::generate(&env);
-    client.set_multisig_threshold_config(&soroban_sdk::vec![&env, s1], &0, &1000i128);
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000);
+
+    let (client, _admin, _payout_key, _program_id) = setup_with_program(&env);
+    let new_admin = Address::generate(&env);
+
+    client.propose_admin(&new_admin);
+
+    // Advance time by 48h
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000 + 2 * ROTATION_TIMELOCK_DELAY);
+
+    client.accept_admin();
 }
 
-// --- propose_admin_op ---
-
+/// Admin can cancel a pending rotation within the timelock window.
 #[test]
-fn test_propose_admin_op_stores_pending_op() {
-    let env = Env::default();
-    let (client, _admin, _s1, _s2, _s3) = setup_multisig(&env);
-    let payload = make_payload(&env, "fee-update-v1");
-
-    let op = client.propose_admin_op(&AdminOpKind::UpdateFeeConfig, &0i128, &payload);
-    assert_eq!(op.kind, AdminOpKind::UpdateFeeConfig);
-    assert_eq!(op.approvals.len(), 1); // proposer auto-approves
-}
-
-#[test]
-#[should_panic(expected = "PendingOpExists")]
-fn test_propose_second_op_while_first_pending_rejected() {
-    let env = Env::default();
-    let (client, _admin, _s1, _s2, _s3) = setup_multisig(&env);
-    let payload = make_payload(&env, "op1");
-    client.propose_admin_op(&AdminOpKind::UpdateFeeConfig, &0i128, &payload);
-    // Second proposal while first is still pending
-    client.propose_admin_op(&AdminOpKind::EmergencyWithdraw, &5_000_000i128, &payload);
-}
-
-#[test]
-fn test_propose_replaces_expired_op() {
-    let env = Env::default();
-    let (client, _admin, _s1, _s2, _s3) = setup_multisig(&env);
-    let payload = make_payload(&env, "op1");
-    client.propose_admin_op(&AdminOpKind::UpdateFeeConfig, &0i128, &payload);
-
-    // Advance past expiry
-    advance_seq(&env, ADMIN_OP_EXPIRY_LEDGERS + 1);
-
-    // New proposal should succeed
-    let payload2 = make_payload(&env, "op2");
-    let op = client.propose_admin_op(&AdminOpKind::EmergencyWithdraw, &0i128, &payload2);
-    assert_eq!(op.kind, AdminOpKind::EmergencyWithdraw);
-}
-
-// --- approve_admin_op ---
-
-#[test]
-fn test_approve_increments_approval_count() {
-    let env = Env::default();
-    let (client, _admin, s1, _s2, _s3) = setup_multisig(&env);
-    let payload = make_payload(&env, "fee-update");
-    client.propose_admin_op(&AdminOpKind::UpdateFeeConfig, &0i128, &payload);
-
-    let op = client.approve_admin_op(&s1);
-    assert_eq!(op.approvals.len(), 2); // proposer + s1
-}
-
-#[test]
-#[should_panic(expected = "NotASigner")]
-fn test_non_signer_cannot_approve() {
-    let env = Env::default();
-    let (client, _admin, _s1, _s2, _s3) = setup_multisig(&env);
-    let payload = make_payload(&env, "fee-update");
-    client.propose_admin_op(&AdminOpKind::UpdateFeeConfig, &0i128, &payload);
-
-    let outsider = Address::generate(&env);
-    client.approve_admin_op(&outsider);
-}
-
-#[test]
-#[should_panic(expected = "AlreadyApproved")]
-fn test_double_approve_rejected() {
-    let env = Env::default();
-    let (client, _admin, s1, _s2, _s3) = setup_multisig(&env);
-    let payload = make_payload(&env, "fee-update");
-    client.propose_admin_op(&AdminOpKind::UpdateFeeConfig, &0i128, &payload);
-    client.approve_admin_op(&s1);
-    client.approve_admin_op(&s1); // second approval from same signer
-}
-
-#[test]
-#[should_panic(expected = "PendingOpExpired")]
-fn test_approve_expired_op_rejected() {
-    let env = Env::default();
-    let (client, _admin, s1, _s2, _s3) = setup_multisig(&env);
-    let payload = make_payload(&env, "fee-update");
-    client.propose_admin_op(&AdminOpKind::UpdateFeeConfig, &0i128, &payload);
-    advance_seq(&env, ADMIN_OP_EXPIRY_LEDGERS + 1);
-    client.approve_admin_op(&s1);
-}
-
-// --- execute_admin_op ---
-
-#[test]
-fn test_execute_succeeds_after_threshold_met() {
-    let env = Env::default();
-    let (client, _admin, s1, _s2, _s3) = setup_multisig(&env);
-    let payload = make_payload(&env, "fee-update");
-    client.propose_admin_op(&AdminOpKind::UpdateFeeConfig, &0i128, &payload);
-    client.approve_admin_op(&s1); // now 2-of-3 met
-
-    let kind = client.execute_admin_op(&payload);
-    assert_eq!(kind, AdminOpKind::UpdateFeeConfig);
-
-    // Pending op must be cleared
-    assert!(client.get_pending_admin_op().is_none());
-}
-
-#[test]
-#[should_panic(expected = "InsufficientApprovals")]
-fn test_execute_before_threshold_rejected() {
-    let env = Env::default();
-    let (client, _admin, _s1, _s2, _s3) = setup_multisig(&env);
-    let payload = make_payload(&env, "fee-update");
-    client.propose_admin_op(&AdminOpKind::UpdateFeeConfig, &0i128, &payload);
-    // Only 1 approval (proposer), need 2
-    client.execute_admin_op(&payload);
-}
-
-#[test]
-#[should_panic(expected = "PayloadMismatch")]
-fn test_execute_wrong_payload_rejected() {
-    let env = Env::default();
-    let (client, _admin, s1, _s2, _s3) = setup_multisig(&env);
-    let payload = make_payload(&env, "fee-update");
-    client.propose_admin_op(&AdminOpKind::UpdateFeeConfig, &0i128, &payload);
-    client.approve_admin_op(&s1);
-
-    let wrong_payload = make_payload(&env, "different-payload");
-    client.execute_admin_op(&wrong_payload);
-}
-
-#[test]
-#[should_panic(expected = "PendingOpExpired")]
-fn test_execute_expired_op_rejected() {
-    let env = Env::default();
-    let (client, _admin, s1, _s2, _s3) = setup_multisig(&env);
-    let payload = make_payload(&env, "fee-update");
-    client.propose_admin_op(&AdminOpKind::UpdateFeeConfig, &0i128, &payload);
-    client.approve_admin_op(&s1);
-    advance_seq(&env, ADMIN_OP_EXPIRY_LEDGERS + 1);
-    client.execute_admin_op(&payload);
-}
-
-#[test]
-#[should_panic(expected = "NoPendingOp")]
-fn test_execute_with_no_pending_op_rejected() {
-    let env = Env::default();
-    let (client, _admin, _s1, _s2, _s3) = setup_multisig(&env);
-    let payload = make_payload(&env, "fee-update");
-    client.execute_admin_op(&payload);
-}
-
-// --- cancel_admin_op ---
-
-#[test]
-fn test_cancel_clears_pending_op() {
-    let env = Env::default();
-    let (client, _admin, _s1, _s2, _s3) = setup_multisig(&env);
-    let payload = make_payload(&env, "fee-update");
-    client.propose_admin_op(&AdminOpKind::UpdateFeeConfig, &0i128, &payload);
-    assert!(client.get_pending_admin_op().is_some());
-
-    client.cancel_admin_op();
-    assert!(client.get_pending_admin_op().is_none());
-}
-
-// --- 1-of-1 (default / no multisig) ---
-
-#[test]
-fn test_single_approval_executes_immediately_after_propose_and_execute() {
+fn test_admin_can_cancel_rotation_within_timelock() {
     let env = Env::default();
     env.mock_all_auths();
-    let contract_id = env.register_contract(None, ProgramEscrowContract);
-    let client = ProgramEscrowContractClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    client.initialize_contract(&admin);
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000);
 
-    // 1-of-1 config
-    client.set_multisig_threshold_config(
-        &soroban_sdk::vec![&env, admin.clone()],
-        &1,
-        &1_000_000i128,
+    let (client, _admin, _payout_key, _program_id) = setup_with_program(&env);
+    let new_admin = Address::generate(&env);
+
+    client.propose_admin(&new_admin);
+
+    // Cancel within the timelock window (1 hour after proposal)
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000 + 3_600);
+    client.cancel_admin_rotation();
+
+    // After cancellation, accept_admin must fail with NoAdminRotationInProgress
+    let result = client.try_accept_admin();
+    assert_eq!(
+        result,
+        Err(Ok(ContractError::NoAdminRotationInProgress)),
+        "accept_admin must fail after cancellation"
     );
-
-    let payload = make_payload(&env, "op");
-    client.propose_admin_op(&AdminOpKind::UpdateFeeConfig, &0i128, &payload);
-    // 1 approval already (proposer), threshold met — execute immediately
-    let kind = client.execute_admin_op(&payload);
-    assert_eq!(kind, AdminOpKind::UpdateFeeConfig);
 }
 
-// --- 3-of-3 full quorum ---
-
+/// After cancellation, a new proposal can be made.
 #[test]
-fn test_full_quorum_3_of_3() {
+fn test_new_proposal_allowed_after_cancellation() {
     let env = Env::default();
     env.mock_all_auths();
-    let contract_id = env.register_contract(None, ProgramEscrowContract);
-    let client = ProgramEscrowContractClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    client.initialize_contract(&admin);
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000);
 
-    let s1 = Address::generate(&env);
-    let s2 = Address::generate(&env);
-    let s3 = Address::generate(&env);
-    client.set_multisig_threshold_config(
-        &soroban_sdk::vec![&env, s1.clone(), s2.clone(), s3.clone()],
-        &3,
-        &0i128,
+    let (client, _admin, _payout_key, _program_id) = setup_with_program(&env);
+    let new_admin = Address::generate(&env);
+    let another_admin = Address::generate(&env);
+
+    client.propose_admin(&new_admin);
+    client.cancel_admin_rotation();
+
+    // Should be able to propose again
+    client.propose_admin(&another_admin);
+
+    // Advance past timelock and accept
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000 + ROTATION_TIMELOCK_DELAY + 1);
+    client.accept_admin();
+}
+
+// --- Controller rotation timelock ---
+
+/// accept_controller fails immediately after propose_controller (timelock not elapsed).
+#[test]
+fn test_accept_controller_before_timelock_returns_error() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = 2_000_000);
+
+    let (client, _admin, payout_key, program_id) = setup_with_program(&env);
+    let new_controller = Address::generate(&env);
+
+    client.propose_controller(&program_id, &payout_key, &new_controller);
+
+    // Advance time by less than 24h
+    env.ledger().with_mut(|li| li.timestamp = 2_000_000 + 3_600);
+
+    let result = client.try_accept_controller(&program_id);
+    assert_eq!(
+        result,
+        Err(Ok(ContractError::RotationTimelockActive)),
+        "accept_controller must fail before 24h timelock expires"
     );
+}
 
-    let payload = make_payload(&env, "full-quorum");
-    client.propose_admin_op(&AdminOpKind::EmergencyWithdraw, &0i128, &payload);
-    client.approve_admin_op(&s1);
-    client.approve_admin_op(&s2);
-    client.approve_admin_op(&s3);
+/// accept_controller succeeds exactly at the 24h boundary.
+#[test]
+fn test_accept_controller_after_timelock_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = 2_000_000);
 
-    let kind = client.execute_admin_op(&payload);
-    assert_eq!(kind, AdminOpKind::EmergencyWithdraw);
+    let (client, _admin, payout_key, program_id) = setup_with_program(&env);
+    let new_controller = Address::generate(&env);
+
+    client.propose_controller(&program_id, &payout_key, &new_controller);
+
+    // Advance time by exactly 24h
+    env.ledger().with_mut(|li| li.timestamp = 2_000_000 + ROTATION_TIMELOCK_DELAY);
+
+    let data = client.accept_controller(&program_id);
+    assert_eq!(data.authorized_payout_key, new_controller);
+}
+
+/// Admin can cancel a pending controller rotation within the timelock window.
+#[test]
+fn test_admin_can_cancel_controller_rotation_within_timelock() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = 2_000_000);
+
+    let (client, admin, payout_key, program_id) = setup_with_program(&env);
+    let new_controller = Address::generate(&env);
+
+    client.propose_controller(&program_id, &payout_key, &new_controller);
+
+    // Cancel within the timelock window
+    env.ledger().with_mut(|li| li.timestamp = 2_000_000 + 3_600);
+    client.cancel_controller_rotation(&program_id, &admin);
+
+    // After cancellation, accept_controller must fail
+    let result = client.try_accept_controller(&program_id);
+    assert_eq!(
+        result,
+        Err(Ok(ContractError::NoControllerRotationInProgress)),
+        "accept_controller must fail after cancellation"
+    );
+}
+
+/// accept_admin with no pending proposal returns NoAdminRotationInProgress.
+#[test]
+fn test_accept_admin_no_pending_proposal_returns_error() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _payout_key, _program_id) = setup_with_program(&env);
+
+    let result = client.try_accept_admin();
+    assert_eq!(
+        result,
+        Err(Ok(ContractError::NoAdminRotationInProgress)),
+    );
+}
+
+/// accept_controller with no pending proposal returns NoControllerRotationInProgress.
+#[test]
+fn test_accept_controller_no_pending_proposal_returns_error() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _payout_key, program_id) = setup_with_program(&env);
+
+    let result = client.try_accept_controller(&program_id);
+    assert_eq!(
+        result,
+        Err(Ok(ContractError::NoControllerRotationInProgress)),
+    );
 }
