@@ -18,6 +18,8 @@ mod traits;
 pub mod upgrade_safety;
 
 #[cfg(test)]
+mod test_fee_on_transfer;
+#[cfg(test)]
 mod test_filter_pagination;
 // #[cfg(test)] mod test_frozen_balance; // pre-existing SDK/API drift blocks filtered test builds
 #[cfg(test)]
